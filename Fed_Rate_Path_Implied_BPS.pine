@@ -1,0 +1,108 @@
+//@version=6
+indicator("Fed Rate Path - Rolling Implied BPS", shorttitle = "Fed BPS", overlay = false,
+     precision = 1, dynamic_requests = true)
+
+const string NY = "America/New_York"
+const int CONTRACT_COUNT = 12
+const color CURRENT_COLOR = #D69424
+const color NEXT_COLOR = #277CCB
+const color PLUS_TWO_COLOR = #9763CB
+const color PLUS_THREE_COLOR = #008F7A
+
+bool showPanel = input.bool(true, "Show contract table")
+
+f_quarter(int clock) =>
+    year(clock, NY) * 4 + int(math.floor((month(clock, NY) - 1) / 3))
+
+f_contract(int quarter) =>
+    string monthCode = switch quarter % 4
+        0 => "H"
+        1 => "M"
+        2 => "U"
+        => "Z"
+    "ZQ" + monthCode + str.tostring(int(math.floor(quarter / 4)))
+
+// Preload the current window and later quarters on historical bars. Pine
+// cannot open a new data context for the first time on a realtime bar.
+var int firstQuarter = f_quarter(timenow)
+int currentQuarter = f_quarter(timenow)
+int firstSlot = currentQuarter - firstQuarter
+bool windowReady = firstSlot >= 0 and firstSlot + 3 < CONTRACT_COUNT
+
+// Use intraday futures bars on minute and second charts, and daily bars otherwise.
+string quoteTf = timeframe.isminutes ? timeframe.period : timeframe.isseconds ? "1" : "1D"
+var array<string> contracts = array.new_string(CONTRACT_COUNT)
+var array<float> quotePrices = array.new_float(CONTRACT_COUNT)
+var array<int> quoteDates = array.new_int(CONTRACT_COUNT)
+
+for slot = 0 to CONTRACT_COUNT - 1
+    if barstate.isfirst
+        array.set(contracts, slot, f_contract(firstQuarter + slot))
+    string symbol = "CBOT:" + array.get(contracts, slot)
+    [price, quoteDate] = request.security(symbol, quoteTf, [close, time_tradingday],
+         gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+    array.set(quotePrices, slot, price)
+    array.set(quoteDates, slot, quoteDate)
+
+[effr, effrDate] = request.security("FRED:EFFR", "1D", [close, time],
+     gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+
+f_rate(int quartersAhead) =>
+    windowReady ? 100.0 - array.get(quotePrices, firstSlot + quartersAhead) : na
+
+// Positive means implied cuts versus EFFR; negative means implied hikes.
+f_bps(float rate) =>
+    math.round((effr - rate) * 100.0, 1)
+
+float currentRate = f_rate(0)
+float nextRate = f_rate(1)
+float plusTwoRate = f_rate(2)
+float plusThreeRate = f_rate(3)
+float currentBps = f_bps(currentRate)
+float nextBps = f_bps(nextRate)
+float plusTwoBps = f_bps(plusTwoRate)
+float plusThreeBps = f_bps(plusThreeRate)
+
+// On a chart left open across the roll, do not connect different contracts.
+bool quarterChanged = not na(currentQuarter[1]) and currentQuarter != currentQuarter[1]
+hline(0, "No change vs EFFR", color = color.gray, linestyle = hline.style_dotted)
+plot(quarterChanged ? na : currentBps, "Current quarter implied bps", CURRENT_COLOR, 2, plot.style_linebr)
+plot(quarterChanged ? na : nextBps, "Next quarter implied bps", NEXT_COLOR, 2, plot.style_linebr)
+plot(quarterChanged ? na : plusTwoBps, "Quarter +2 implied bps", PLUS_TWO_COLOR, 2, plot.style_linebr)
+plot(quarterChanged ? na : plusThreeBps, "Quarter +3 implied bps", PLUS_THREE_COLOR, 2, plot.style_linebr)
+
+var table panel = showPanel ? table.new(position.top_right, 4, 7,
+     bgcolor = chart.bg_color, frame_color = color.new(chart.fg_color, 65), frame_width = 1) : na
+
+f_cell(int col, int row, string value, color background = na) =>
+    table.cell(panel, col, row, value, bgcolor = background, text_color = chart.fg_color, text_size = size.small)
+
+f_date(int value) =>
+    na(value) ? "-" : str.format_time(value, "yyyy-MM-dd", "UTC")
+
+f_row(int row, int quartersAhead, float rate, float bps, color lineColor) =>
+    int slot = firstSlot + quartersAhead
+    string contract = windowReady ? array.get(contracts, slot) : f_contract(currentQuarter + quartersAhead)
+    int quoteDate = windowReady ? array.get(quoteDates, slot) : na
+    f_cell(0, row, contract, color.new(lineColor, 68))
+    f_cell(1, row, na(rate) ? "Unavailable" : str.tostring(rate, "0.000") + "%")
+    string bpsLabel = na(bps) ? "-" : (bps > 0 ? "+" : "") + str.tostring(bps, "0.0")
+    f_cell(2, row, bpsLabel)
+    f_cell(3, row, na(rate) ? "-" : f_date(quoteDate))
+
+if showPanel and barstate.isfirst
+    table.merge_cells(panel, 0, 0, 3, 0)
+    table.merge_cells(panel, 0, 6, 3, 6)
+
+if showPanel and barstate.islast
+    f_cell(0, 0, "Fed Rate Path | Rolling 4 Quarters")
+    f_cell(0, 1, "Contract")
+    f_cell(1, 1, "Implied rate")
+    f_cell(2, 1, "Change (bp)")
+    f_cell(3, 1, "Trading date")
+    f_row(2, 0, currentRate, currentBps, CURRENT_COLOR)
+    f_row(3, 1, nextRate, nextBps, NEXT_COLOR)
+    f_row(4, 2, plusTwoRate, plusTwoBps, PLUS_TWO_COLOR)
+    f_row(5, 3, plusThreeRate, plusThreeBps, PLUS_THREE_COLOR)
+    string baseline = na(effr) ? "EFFR unavailable" : "EFFR " + str.tostring(effr, "0.00") + "% (" + f_date(effrDate) + ")"
+    f_cell(0, 6, windowReady ? baseline + " | + cuts / - hikes" : "Reload to load the next contracts")
